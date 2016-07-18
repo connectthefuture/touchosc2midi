@@ -23,11 +23,27 @@ import mido
 import liblo
 import logging
 import time
-from advertise import PORT, main_ip, Advertisement
 from configuration import list_backends, list_ports, configure_ioports, get_mido_backend
+
+from netaddr import IPNetwork
 
 log = logging.getLogger(__name__)
 
+PORT = 12345
+
+def main_ip():
+    """
+    '192.0.2.0' is defined TEST-NET in RFC 5737,
+    so there *shouldn't* be custom routing for this.
+
+    :return: the IP of the default route's interface.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.connect(("192.0.2.0", 0))
+    ip = sock.getsockname()[0]
+    log.debug("Assuming {} for main route's IP.".format(ip))
+    sock.close()
+    return ip
 
 def message_from_oscmidipayload(bites):
     """Convert the last 4 OSC-midi bytes into a mido message.
@@ -67,8 +83,9 @@ def create_callback_on_midi(target):
         if message.type == "clock":
             return
         log.debug("received: {}".format(message))
-        osc = liblo.Message('/midi')
-        osc.add(('m', message_to_oscmidipayload(message)))
+        b = message.bytes()
+        osc = liblo.Message('/midi/{0}/{1}'.format(8, b[1]))
+        osc.add(('f', (float(b[2]) / 128.0)))
         log.debug("Sending OSC-Midi {} to: {}:{} UDP: {} URL: {}".format(
             osc,
             target.get_hostname(),
@@ -77,17 +94,6 @@ def create_callback_on_midi(target):
             target.get_url()))
         liblo.send(target, osc)
     return callback
-
-
-def wait_for_target_address(ip=None):
-    """Waits for a byte on the OSC-PORT to arrive.
-    Extract the sender IP-address, this will become our OSC target.
-    """
-    log.info("Waiting for first package from touchOSC in order to setup target address...")
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((ip or main_ip(), PORT))
-    _, (address, _) = s.recvfrom(1)
-    return address
 
 
 def main():
@@ -109,12 +115,13 @@ def main():
                                                   mido_in=options.get('--midi-in'),
                                                   mido_out=options.get('--midi-out'))
 
-            psa = Advertisement(ip=options.get('--ip'))
-            psa.register()
+            ip = options.get('--ip')
+            target_address = options.get('--ip')
+            if not target_address:
+                ip_network = IPNetwork(main_ip() + "/16")
+                target_address = str(ip_network.broadcast)
 
-            target_address = wait_for_target_address()
-
-            log.debug("Listening for touchOSC on {}:{}.".format(psa.ip, PORT))
+            log.debug("Listening on {}:{}.".format(target_address, PORT))
             server = liblo.ServerThread(PORT)
             server.add_method('/midi', 'm', create_callback_on_osc(midi_out))
 
@@ -128,8 +135,6 @@ def main():
             while True:
                 time.sleep(.0001)
         except KeyboardInterrupt:
-            psa.unregister()
-            psa.close()
             server.stop()
             server.free()
             midi_in.close()
